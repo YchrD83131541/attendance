@@ -70,3 +70,4 @@ coll = COLLECT(
     upx_exclude=[],
     name="勤怠管理",
 )
+
