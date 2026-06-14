@@ -5,6 +5,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import hashlib
 import hmac
+import shutil
 
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -35,13 +36,13 @@ except Exception:
 C_BG        = "#F0F4FF"   # 全体背景
 C_HEADER    = "#4A7FD4"   # ヘッダー帯
 C_HEADER_FG = "#FFFFFF"
-C_BTN_CHECK = "#5CB85C"   # 出勤ボタン
+C_BTN_CHECK = "#4C924C"   # 出勤ボタン
 C_BTN_OUT   = "#E87C2B"   # 退勤ボタン
 C_BTN_LESS  = "#5BC0DE"   # レッスン追加
 C_BTN_SAVE  = "#9B59B6"   # 訂正保存
 C_BTN_DEL   = "#E74C3C"   # 削除
 C_BTN_REFR  = "#7F8C8D"   # 更新
-C_BTN_REP   = "#2E86AB"   # 集計
+C_BTN_REP   = "#1D7094"   # 集計
 C_BTN_XLS   = "#27AE60"   # Excel出力
 C_ROW_ODD   = "#FFFFFF"
 C_ROW_EVEN  = "#EAF0FB"
@@ -98,7 +99,11 @@ def _load_staff_list():
     if os.path.exists(STAFF_FILE):
         try:
             with open(STAFF_FILE, encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+                if isinstance(data, list):
+                    if all(isinstance(item, str) for item in data):
+                        return [{"name": item, "category": "一般"} for item in data]
+                    return [item if isinstance(item, dict) else {"name": str(item), "category": "一般"} for item in data]
         except Exception:
             return []
     return []
@@ -238,15 +243,21 @@ class AttendanceGUI(tk.Tk):
         self.configure(bg=C_BG)
         self.sort_by_name = False
         self.staff_list = _load_staff_list()
+        self.staff_list.sort(key=lambda item: item.get("name", "") if isinstance(item, dict) else str(item))
         self._edit_original_date = None
+        self._overtime_alert_shown = False
         self._apply_style()
         self.create_widgets()
         self.refresh_records()
+        # キーボードショートカット
+        self.bind("<Control-s>", lambda e: self.on_save_corrections())
+        self.bind("<F5>", lambda e: self.refresh_records())
+        self.bind("<Control-Return>", lambda e: self.on_register())
         # 起動時に36協定の警告をチェック
         try:
             self.check_overtime_alerts()
-        except Exception:
-            pass
+        except Exception as exc:
+            self.set_status(f"36協定チェックエラー: {exc}", error=True)
 
     # ── スタイル設定 ──────────────────────────────
     def _apply_style(self):
@@ -314,6 +325,9 @@ class AttendanceGUI(tk.Tk):
         _color_btn(
             sort_row, "スタッフ管理", self.open_staff_manager, C_BTN_SAVE, width=12
         ).pack(side=tk.LEFT, padx=(6, 0))
+        _color_btn(
+            sort_row, "ユーザー管理", self.open_user_manager, C_BTN_REP, width=12
+        ).pack(side=tk.LEFT, padx=(6, 0))
 
         # ─ 入力行
         top = tk.Frame(frame, bg=C_BG)
@@ -330,48 +344,77 @@ class AttendanceGUI(tk.Tk):
         self.name_combo.grid(row=0, column=1, sticky=tk.W)
         self._update_staff_combobox()
 
-        # ロール（メイン/サブ）
-        role_frame = tk.Frame(top, bg=C_BG)
-        role_frame.grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
-        self.role_radio_var = tk.StringVar(value="メイン")
-        ttk.Radiobutton(role_frame, text="メイン", variable=self.role_radio_var, value="メイン",
-                        command=lambda: self.role_var.set("メイン")).pack(side=tk.LEFT)
-        ttk.Radiobutton(role_frame, text="サブ",   variable=self.role_radio_var, value="サブ",
-                        command=lambda: self.role_var.set("サブ")).pack(side=tk.LEFT)
+        lbl(top, "日付:", 0, 2, padx=12)
+        self.date_var = tk.StringVar(value=datetime.date.today().isoformat())
+        ttk.Entry(top, textvariable=self.date_var, width=14).grid(row=0, column=3, sticky=tk.W)
 
-        # 勤務区分
-        lbl(top, "勤務区分:", 1, 2, padx=12)
+        lbl(top, "勤務区分:", 0, 4, padx=12)
         self.work_type_var = tk.StringVar(value="通常出勤")
         ttk.Combobox(
             top, textvariable=self.work_type_var,
             values=("通常出勤", "所定休日出勤", "法定休日出勤"),
             width=13, state="readonly",
-        ).grid(row=1, column=3, sticky=tk.W)
+        ).grid(row=0, column=5, sticky=tk.W)
 
-        lbl(top, "日付:", 0, 2, padx=12)
-        self.date_var = tk.StringVar(value=datetime.date.today().isoformat())
-        ttk.Entry(top, textvariable=self.date_var, width=14).grid(row=0, column=3, sticky=tk.W)
-
-        lbl(top, "レッスン数:", 0, 4, padx=12)
-        self.lessons_var = tk.StringVar(value="1")
-        ttk.Entry(top, textvariable=self.lessons_var, width=5).grid(row=0, column=5, sticky=tk.W)
-
-        lbl(top, "休憩(分):", 0, 6, padx=12)
-        self.break_var = tk.StringVar(value="0")
-        ttk.Entry(top, textvariable=self.break_var, width=5).grid(row=0, column=7, sticky=tk.W)
-
-        lbl(top, "事務作業:", 0, 8, padx=12)
+        # 担当・レッスン数・事務作業は time_frame 内（休憩終了の右側）に配置
+        self.role_var          = tk.StringVar(value="メイン")
+        self.lessons_var       = tk.StringVar(value="0")
         self.admin_hours_var   = tk.StringVar(value="0")
         self.admin_minutes_var = tk.StringVar(value="0")
-        ttk.Entry(top, textvariable=self.admin_hours_var,   width=4).grid(row=0, column=9,  sticky=tk.W)
-        tk.Label(top, text="h", bg=C_BG).grid(row=0, column=10, sticky=tk.W)
-        ttk.Entry(top, textvariable=self.admin_minutes_var, width=4).grid(row=0, column=11, sticky=tk.W, padx=(4, 0))
-        tk.Label(top, text="m", bg=C_BG).grid(row=0, column=12, sticky=tk.W)
+        self.break_var         = tk.StringVar(value="0")
 
-        lbl(top, "担当:", 0, 13, padx=12)
-        self.role_var = tk.StringVar(value="メイン")
-        ttk.Combobox(top, textvariable=self.role_var, values=("メイン", "サブ"),
-                     width=7, state="readonly").grid(row=0, column=14, sticky=tk.W)
+        # ─ 時刻入力・表示行
+        time_frame = tk.Frame(frame, bg=C_BG)
+        time_frame.pack(fill=tk.X, pady=(0, 6))
+
+        def tlbl(text, row, col, padx=0):
+            tk.Label(time_frame, text=text, bg=C_BG, font=FONT_MAIN).grid(
+                row=row, column=col, sticky=tk.W, padx=(padx, 2)
+            )
+
+        # 入力行（出勤・退勤・休憩開始・休憩終了を一列に）
+        tlbl("出勤時間:", 0, 0)
+        self.checkin_time_var = tk.StringVar(value="")
+        ttk.Entry(time_frame, textvariable=self.checkin_time_var, width=16).grid(row=0, column=1, sticky=tk.W)
+
+        tlbl("退勤時間:", 0, 2, padx=8)
+        self.checkout_time_var = tk.StringVar(value="")
+        ttk.Entry(time_frame, textvariable=self.checkout_time_var, width=16).grid(row=0, column=3, sticky=tk.W)
+
+        tlbl("休憩時間(分):", 0, 4, padx=8)
+        ttk.Entry(time_frame, textvariable=self.break_var, width=6).grid(row=0, column=5, sticky=tk.W)
+        self.break_start_var = tk.StringVar(value="")
+        self.break_end_var = tk.StringVar(value="")
+
+        tlbl("担当:", 0, 8, padx=8)
+        ttk.Combobox(time_frame, textvariable=self.role_var, values=("メイン", "サブ"),
+                     width=7, state="readonly").grid(row=0, column=9, sticky=tk.W)
+
+        tlbl("レッスン数:", 0, 10, padx=8)
+        ttk.Entry(time_frame, textvariable=self.lessons_var, width=5).grid(row=0, column=11, sticky=tk.W)
+
+        tlbl("事務作業:", 0, 12, padx=8)
+        ttk.Entry(time_frame, textvariable=self.admin_hours_var,   width=4).grid(row=0, column=13, sticky=tk.W)
+        tk.Label(time_frame, text="h", bg=C_BG).grid(row=0, column=14, sticky=tk.W)
+        ttk.Entry(time_frame, textvariable=self.admin_minutes_var, width=4).grid(row=0, column=15, sticky=tk.W, padx=(4, 0))
+        tk.Label(time_frame, text="m", bg=C_BG).grid(row=0, column=16, sticky=tk.W)
+
+        # 表示行（休憩・総勤務・実働・深夜）
+        tlbl("休憩:", 1, 0)
+        self.break_display_var = tk.StringVar(value="0分")
+        tk.Label(time_frame, textvariable=self.break_display_var, bg=C_BG, width=8, anchor=tk.W).grid(row=1, column=1, sticky=tk.W)
+
+        tlbl("総勤務:", 1, 2, padx=8)
+        self.total_work_var = tk.StringVar(value="-")
+        tk.Label(time_frame, textvariable=self.total_work_var, bg=C_BG, width=10, anchor=tk.W).grid(row=1, column=3, sticky=tk.W)
+
+        tlbl("実働時間:", 1, 4, padx=8)
+        self.actual_hours_var = tk.StringVar(value="-")
+        tk.Label(time_frame, textvariable=self.actual_hours_var, bg=C_BG, width=10, anchor=tk.W).grid(row=1, column=5, sticky=tk.W)
+
+        tlbl("深夜時間:", 1, 6, padx=8)
+        self.night_hours_var = tk.StringVar(value="-")
+        tk.Label(time_frame, textvariable=self.night_hours_var, bg=C_BG, width=10, anchor=tk.W).grid(row=1, column=7, sticky=tk.W)
 
         # ─ ボタン行
         btn_row = tk.Frame(frame, bg=C_BG)
@@ -380,14 +423,13 @@ class AttendanceGUI(tk.Tk):
         buttons = [
             ("✅ 登録",       self.on_register,         C_BTN_CHECK),
             ("📚 レッスン追加", self.on_add_lessons,    C_BTN_LESS),
-            ("💾 訂正保存",   self.on_save_corrections,  C_BTN_SAVE),
-            ("🗑 削除",       self.on_delete_selected,   C_BTN_DEL),
-            ("🔄 更新",       self.refresh_records,      C_BTN_REFR),
-            ("📊 集計",       self.show_report,          C_BTN_REP),
-            ("📝 36協定管理",  self.open_labor_manager,   "#D35400"),
-            ("👤 ユーザー管理", self.open_user_manager,   "#8E44AD"),
-            ("📥 Excel出力",  self.export_excel,          C_BTN_XLS),
+            ("💾 訂正保存",    self.on_save_corrections, C_BTN_SAVE),
+            ("🗑 削除",       self.on_delete_selected,  C_BTN_DEL),
+            ("📊 集計",       self.show_report,         C_BTN_REP),
+            ("📝 36協定管理",  self.open_labor_manager,  "#D35400"),
+            ("📥 Excel出力",  self.export_excel,        C_BTN_XLS),
             ("🌴 有給管理",  self.open_paid_leave_manager, "#16A085"),
+            ("🔄 更新",       self.refresh_records,     C_BTN_REFR),
         ]
         for text, cmd, color in buttons:
             _color_btn(btn_row, text, cmd, color, width=11).pack(side=tk.LEFT, padx=3)
@@ -400,34 +442,21 @@ class AttendanceGUI(tk.Tk):
         )
         self.status_label.pack(fill=tk.X, pady=(2, 6))
 
-        # ─ 時刻表示行
-        time_frame = tk.Frame(frame, bg=C_BG)
-        time_frame.pack(fill=tk.X, pady=(0, 6))
-
-        def tlbl(text, col, padx=0):
-            tk.Label(time_frame, text=text, bg=C_BG, font=FONT_MAIN).grid(
-                row=0, column=col, sticky=tk.W, padx=(padx, 2)
-            )
-
-        tlbl("出勤時間:", 0)
-        self.checkin_time_var = tk.StringVar(value="")
-        ttk.Entry(time_frame, textvariable=self.checkin_time_var, width=22).grid(row=0, column=1, sticky=tk.W)
-
-        tlbl("退勤時間:", 2, padx=10)
-        self.checkout_time_var = tk.StringVar(value="")
-        ttk.Entry(time_frame, textvariable=self.checkout_time_var, width=22).grid(row=0, column=3, sticky=tk.W)
-
-        tlbl("休憩:", 4, padx=8)
-        self.break_display_var = tk.StringVar(value="0分")
-        tk.Label(time_frame, textvariable=self.break_display_var, bg=C_BG, width=8, anchor=tk.W).grid(row=0, column=5, sticky=tk.W)
-
-        tlbl("総勤務:", 6, padx=8)
-        self.total_work_var = tk.StringVar(value="-")
-        tk.Label(time_frame, textvariable=self.total_work_var, bg=C_BG, width=10, anchor=tk.W).grid(row=0, column=7, sticky=tk.W)
-
-        tk.Label(time_frame, text="実働時間:", bg=C_BG, font=FONT_MAIN).grid(row=1, column=0, sticky=tk.W)
-        self.actual_hours_var = tk.StringVar(value="-")
-        tk.Label(time_frame, textvariable=self.actual_hours_var, bg=C_BG, width=22, anchor=tk.W).grid(row=1, column=1, sticky=tk.W)
+        # ─ フィルター行
+        filter_row = tk.Frame(frame, bg=C_BG)
+        filter_row.pack(fill=tk.X, pady=(0, 4))
+        tk.Label(filter_row, text="月:", bg=C_BG, font=FONT_MAIN).pack(side=tk.LEFT)
+        self.filter_month_var = tk.StringVar(value="")
+        self.filter_month_combo = ttk.Combobox(filter_row, textvariable=self.filter_month_var,
+                                               width=10, state="readonly")
+        self.filter_month_combo.pack(side=tk.LEFT, padx=(2, 8))
+        tk.Label(filter_row, text="名前:", bg=C_BG, font=FONT_MAIN).pack(side=tk.LEFT)
+        self.filter_name_var = tk.StringVar(value="")
+        self.filter_name_combo_filter = ttk.Combobox(filter_row, textvariable=self.filter_name_var,
+                                                     width=14, state="readonly")
+        self.filter_name_combo_filter.pack(side=tk.LEFT, padx=(2, 8))
+        _color_btn(filter_row, "絞り込み", self.refresh_records, C_BTN_REFR, width=8).pack(side=tk.LEFT)
+        _color_btn(filter_row, "クリア", self.clear_filter, C_BTN_REFR, width=8).pack(side=tk.LEFT, padx=(4, 0))
 
         # ─ Treeview
         tree_frame = tk.Frame(frame, bg=C_BG)
@@ -462,12 +491,18 @@ class AttendanceGUI(tk.Tk):
 
     # ── スタッフ管理 ──────────────────────────────
     def _update_staff_combobox(self):
-        self.name_combo["values"] = self.staff_list
+        self.name_combo["values"] = [s.get("name") for s in self.staff_list if isinstance(s, dict)]
+
+    def _get_staff_category(self, name):
+        for staff in self.staff_list:
+            if isinstance(staff, dict) and staff.get("name") == name:
+                return staff.get("category", "一般")
+        return "一般"
 
     def open_staff_manager(self):
         dlg = tk.Toplevel(self)
         dlg.title("スタッフ管理")
-        dlg.geometry("280x380")
+        dlg.geometry("320x400")
         dlg.resizable(False, False)
         dlg.configure(bg=C_BG)
         dlg.grab_set()
@@ -480,8 +515,11 @@ class AttendanceGUI(tk.Tk):
         lb = tk.Listbox(list_frame, font=FONT_MAIN, selectbackground=C_SELECT, height=12, relief=tk.FLAT, bd=1)
         sb_lb = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=lb.yview)
         lb.configure(yscrollcommand=sb_lb.set)
-        for name in self.staff_list:
-            lb.insert(tk.END, name)
+        for staff in self.staff_list:
+            if isinstance(staff, dict):
+                lb.insert(tk.END, f"{staff.get('name')} ({staff.get('category','一般')})")
+            else:
+                lb.insert(tk.END, str(staff))
         lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb_lb.pack(side=tk.RIGHT, fill=tk.Y)
 
@@ -491,21 +529,43 @@ class AttendanceGUI(tk.Tk):
         new_name_var = tk.StringVar()
         entry = ttk.Entry(input_frame, textvariable=new_name_var, width=16)
         entry.pack(side=tk.LEFT, padx=(4, 0))
+        tk.Label(input_frame, text="区分:", bg=C_BG, font=FONT_MAIN).pack(side=tk.LEFT, padx=(8, 0))
+        new_category_var = tk.StringVar(value="一般")
+        ttk.Combobox(input_frame, textvariable=new_category_var,
+                     values=("一般", "年少者", "妊産婦"), width=10, state="readonly").pack(side=tk.LEFT, padx=(4, 0))
 
         def refresh_lb():
             lb.delete(0, tk.END)
-            for n in self.staff_list:
-                lb.insert(tk.END, n)
+            for staff in self.staff_list:
+                if isinstance(staff, dict):
+                    lb.insert(tk.END, f"{staff.get('name')} ({staff.get('category','一般')})")
+                else:
+                    lb.insert(tk.END, str(staff))
+
+        def on_select(event=None):
+            sel = lb.curselection()
+            if not sel:
+                return
+            item_text = lb.get(sel[0])
+            old_name = item_text.split(" (")[0]
+            for staff in self.staff_list:
+                if isinstance(staff, dict) and staff.get("name") == old_name:
+                    new_name_var.set(old_name)
+                    new_category_var.set(staff.get("category", "一般"))
+                    break
+
+        lb.bind("<<ListboxSelect>>", on_select)
 
         def add_staff():
             name = new_name_var.get().strip()
+            category = new_category_var.get().strip() or "一般"
             if not name:
                 return
-            if name in self.staff_list:
+            if any(staff.get("name") == name for staff in self.staff_list if isinstance(staff, dict)):
                 messagebox.showwarning("重複", f"「{name}」は既に登録されています。", parent=dlg)
                 return
-            self.staff_list.append(name)
-            self.staff_list.sort()
+            self.staff_list.append({"name": name, "category": category})
+            self.staff_list.sort(key=lambda item: item.get("name", "") if isinstance(item, dict) else str(item))
             _save_staff_list(self.staff_list)
             self._update_staff_combobox()
             refresh_lb()
@@ -514,14 +574,51 @@ class AttendanceGUI(tk.Tk):
 
         entry.bind("<Return>", lambda _: add_staff())
 
+        def rename_staff():
+            sel = lb.curselection()
+            if not sel:
+                messagebox.showwarning("修正", "修正するスタッフをリストから選択してください。", parent=dlg)
+                return
+            item_text = lb.get(sel[0])
+            old_name = item_text.split(" (")[0]
+            new_name = new_name_var.get().strip()
+            new_cat  = new_category_var.get().strip() or "一般"
+            if not new_name:
+                messagebox.showwarning("入力エラー", "新しい名前を入力してください。", parent=dlg)
+                return
+            if new_name != old_name and any(
+                s.get("name") == new_name for s in self.staff_list if isinstance(s, dict)
+            ):
+                messagebox.showwarning("重複", f"「{new_name}」は既に登録されています。", parent=dlg)
+                return
+            for staff in self.staff_list:
+                if isinstance(staff, dict) and staff.get("name") == old_name:
+                    staff["name"] = new_name
+                    staff["category"] = new_cat
+                    break
+            self.staff_list.sort(key=lambda item: item.get("name", "") if isinstance(item, dict) else str(item))
+            _save_staff_list(self.staff_list)
+            if new_name != old_name:
+                am = labor.AttendanceManager()
+                rows = am.read_rows()
+                for r in rows:
+                    if r.get("name") == old_name:
+                        r["name"] = new_name
+                am.save_rows(rows)
+                self.refresh_records()
+            self._update_staff_combobox()
+            refresh_lb()
+            self.set_status(f"「{old_name}」→「{new_name}」に修正しました。")
+
         def delete_staff():
             sel = lb.curselection()
             if not sel:
                 messagebox.showwarning("削除", "削除するスタッフを選択してください。", parent=dlg)
                 return
-            name = lb.get(sel[0])
+            item_text = lb.get(sel[0])
+            name = item_text.split(" (")[0]
             if messagebox.askyesno("確認", f"「{name}」を削除しますか？", parent=dlg):
-                self.staff_list.remove(name)
+                self.staff_list = [staff for staff in self.staff_list if not (isinstance(staff, dict) and staff.get("name") == name)]
                 _save_staff_list(self.staff_list)
                 self._update_staff_combobox()
                 refresh_lb()
@@ -529,6 +626,7 @@ class AttendanceGUI(tk.Tk):
         btn_frame = tk.Frame(dlg, bg=C_BG)
         btn_frame.pack(pady=(6, 10))
         _color_btn(btn_frame, "追加", add_staff,    C_BTN_CHECK, width=8).pack(side=tk.LEFT, padx=4)
+        _color_btn(btn_frame, "修正", rename_staff, C_BTN_SAVE,  width=8).pack(side=tk.LEFT, padx=4)
         _color_btn(btn_frame, "削除", delete_staff, C_BTN_DEL,   width=8).pack(side=tk.LEFT, padx=4)
 
     # ── ユーザー管理 ──────────────────────────────
@@ -663,6 +761,21 @@ class AttendanceGUI(tk.Tk):
         _color_btn(btn_frame, "パスワード変更", change_password, C_BTN_SAVE, width=14).pack(side=tk.LEFT, padx=2)
         _color_btn(btn_frame, "削除", delete_user, C_BTN_DEL, width=8).pack(side=tk.LEFT, padx=2)
 
+    def _clear_inputs(self):
+        self.name_combo.set("")
+        self.date_var.set(datetime.date.today().isoformat())
+        self.checkin_time_var.set("")
+        self.checkout_time_var.set("")
+        self.break_var.set("0")
+        self.admin_hours_var.set("0")
+        self.admin_minutes_var.set("0")
+        self.lessons_var.set("0")
+        self.actual_hours_var.set("-")
+        self.total_work_var.set("-")
+        self.night_hours_var.set("-")
+        self.break_display_var.set("0分")
+        self._edit_original_date = None
+
     # ── ヘルパー ─────────────────────────────────
     def parse_date(self):
         text = self.date_var.get().strip()
@@ -688,6 +801,14 @@ class AttendanceGUI(tk.Tk):
             return "-"
         try:
             return datetime.datetime.fromisoformat(ts).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return ts
+
+    def format_time(self, ts):
+        if not ts:
+            return ""
+        try:
+            return datetime.datetime.fromisoformat(ts).strftime("%H:%M")
         except Exception:
             return ts
 
@@ -756,6 +877,7 @@ class AttendanceGUI(tk.Tk):
             self.admin_minutes_var.set(str(am % 60))
             self.actual_hours_var.set(f"{attendance.calculate_actual_hours(row):.2f}h")
             self.total_work_var.set(self.format_total_work(row))
+            self.night_hours_var.set(f"{attendance.calculate_night_hours(row):.2f}h")
 
     def update_time_labels(self):
         self.checkin_time_var.set("-")
@@ -785,6 +907,7 @@ class AttendanceGUI(tk.Tk):
             self.admin_minutes_var.set(str(am % 60))
             self.actual_hours_var.set(f"{attendance.calculate_actual_hours(row):.2f}h")
             self.total_work_var.set(self.format_total_work(row))
+            self.night_hours_var.set(f"{attendance.calculate_night_hours(row):.2f}h")
         except Exception:
             pass
 
@@ -809,7 +932,9 @@ class AttendanceGUI(tk.Tk):
             checkin_dt  = self.parse_timestamp(self.checkin_time_var.get())
             checkout_dt = self.parse_timestamp(self.checkout_time_var.get())
 
-            bk        = int(self.break_var.get() or 0)
+            break_start_dt = None
+            break_end_dt = None
+            bk = int(self.break_var.get() or 0)
             ah        = int(self.admin_hours_var.get() or 0)
             am_val    = int(self.admin_minutes_var.get() or 0)
             admin_min = ah * 60 + am_val
@@ -828,6 +953,8 @@ class AttendanceGUI(tk.Tk):
                 existing["checkin"]       = checkin_dt.isoformat()  if checkin_dt  else existing.get("checkin", "")
                 existing["checkout"]      = checkout_dt.isoformat() if checkout_dt else ""
                 existing["break_minutes"] = str(bk)
+                existing["break_start"]   = break_start_dt.isoformat() if break_start_dt else existing.get("break_start", "")
+                existing["break_end"]     = break_end_dt.isoformat()   if break_end_dt   else existing.get("break_end", "")
                 existing["admin_minutes"] = str(admin_min)
                 if role == "メイン":
                     existing["lessons_main"] = str(lessons)
@@ -842,20 +969,27 @@ class AttendanceGUI(tk.Tk):
                     "checkin":       checkin_dt.isoformat()  if checkin_dt  else "",
                     "checkout":      checkout_dt.isoformat() if checkout_dt else "",
                     "break_minutes": str(bk),
+                    "break_start":   break_start_dt.isoformat() if break_start_dt else "",
+                    "break_end":     break_end_dt.isoformat()   if break_end_dt   else "",
                     "admin_minutes": str(admin_min),
                     "lessons_main":  str(lessons) if role == "メイン" else "0",
                     "lessons_sub":   str(lessons) if role == "サブ"   else "0",
                 }
                 rows.append(new_row)
 
+            self._make_backup()
             am_obj.save_rows(rows)
-            self._edit_original_date = date_str
             self.set_status(f"「{name}」{date_str} を登録しました。")
             self.refresh_records()
+            self._clear_inputs()
+            try:
+                self._check_entry_labor_law(name, date_str)
+            except Exception as exc:
+                self.set_status(f"労基法チェックエラー: {exc}", error=True)
             try:
                 self.check_overtime_alerts()
-            except Exception:
-                pass
+            except Exception as exc:
+                self.set_status(f"36協定チェックエラー: {exc}", error=True)
         except ValueError as exc:
             messagebox.showerror("入力エラー", str(exc))
             self.set_status(str(exc), error=True)
@@ -889,7 +1023,15 @@ class AttendanceGUI(tk.Tk):
             self.set_status(str(exc), error=True)
 
     def refresh_records(self):
-        rows = attendance.read_rows()
+        all_rows = attendance.read_rows()
+
+        # フィルター適用
+        month_f = self.filter_month_var.get().strip()
+        name_f  = self.filter_name_var.get().strip()
+        rows = [r for r in all_rows
+                if (not month_f or r.get("date", "").startswith(month_f))
+                and (not name_f or r.get("name") == name_f)]
+
         if self.sort_by_name:
             rows = sorted(rows, key=lambda r: (r["name"].lower(), r["date"], int(r["id"])))
         else:
@@ -897,7 +1039,7 @@ class AttendanceGUI(tk.Tk):
 
         for item in self.tree.get_children():
             self.tree.delete(item)
-        for i, r in enumerate(rows[:100]):
+        for i, r in enumerate(rows):
             tag = "even" if i % 2 == 0 else "odd"
             self.tree.insert("", tk.END, tags=(tag,), values=(
                 r["date"],
@@ -910,7 +1052,36 @@ class AttendanceGUI(tk.Tk):
                 self.format_lessons(r),
                 self.format_admin_time(r),
             ))
-        self.set_status(f"レコードを {len(rows[:100])} 件表示しました。")
+
+        # フィルターのドロップダウン選択肢を更新
+        months = sorted({r["date"][:7] for r in all_rows if r.get("date", "") >= "2000"}, reverse=True)
+        self.filter_month_combo["values"] = [""] + months
+        self.filter_name_combo_filter["values"] = [""] + sorted(
+            {r.get("name", "") for r in all_rows if r.get("name")})
+
+        total = len(all_rows)
+        shown = len(rows)
+        msg = f"{shown} 件表示" if shown == total else f"{shown} 件表示（全 {total} 件中）"
+        self.set_status(msg)
+
+    def clear_filter(self):
+        self.filter_month_var.set("")
+        self.filter_name_var.set("")
+        self.refresh_records()
+
+    def _make_backup(self):
+        """データ保存前に日付付きバックアップを作成する。"""
+        src = labor.DEFAULT_CSV
+        if not os.path.exists(src):
+            return
+        today = datetime.date.today().strftime("%Y%m%d")
+        backup_dir = os.path.join(os.path.dirname(src), "backup")
+        os.makedirs(backup_dir, exist_ok=True)
+        dst = os.path.join(backup_dir, f"attendance_backup_{today}.csv")
+        try:
+            shutil.copy2(src, dst)
+        except Exception as exc:
+            self.set_status(f"バックアップ作成に失敗: {exc}", error=True)
 
     def on_save_corrections(self):
         try:
@@ -935,20 +1106,32 @@ class AttendanceGUI(tk.Tk):
                 if checkout:
                     checkout = datetime.datetime.combine(dt.date(), checkout.time())
 
-            bk = int(self.break_var.get())
+            break_start_dt = None
+            break_end_dt = None
+            bk = int(self.break_var.get() or 0)
             ah = int(self.admin_hours_var.get())
             am = int(self.admin_minutes_var.get())
+            self._make_backup()
             msg = attendance.update_record(
                 names[0], lookup_date,
                 checkin=checkin, checkout=checkout,
-                break_minutes=bk, admin_minutes=ah * 60 + am,
+                break_minutes=bk, break_start=break_start_dt, break_end=break_end_dt,
+                admin_minutes=ah * 60 + am,
                 role=self.role_var.get(),
                 work_type=self.work_type_var.get(),
                 new_date=new_date,
             )
-            self._edit_original_date = when_date
             self.set_status(msg)
             self.refresh_records()
+            self._clear_inputs()
+            try:
+                self._check_entry_labor_law(names[0], when_date)
+            except Exception as exc:
+                self.set_status(f"労基法チェックエラー: {exc}", error=True)
+            try:
+                self.check_overtime_alerts()
+            except Exception as exc:
+                self.set_status(f"36協定チェックエラー: {exc}", error=True)
         except (ValueError, Exception) as exc:
             messagebox.showerror("エラー", str(exc))
             self.set_status(str(exc), error=True)
@@ -960,6 +1143,7 @@ class AttendanceGUI(tk.Tk):
             return
         if not messagebox.askyesno("確認", "選択したレコードを削除しますか？"):
             return
+        self._make_backup()
         msgs = []
         for item in selected:
             vals = self.tree.item(item, "values")
@@ -974,13 +1158,14 @@ class AttendanceGUI(tk.Tk):
         for r in rows:
             name = r["name"]
             if name not in by_name:
-                by_name[name] = {"hours": 0.0, "lessons_main": 0, "lessons_sub": 0}
+                by_name[name] = {"hours": 0.0, "lessons_main": 0, "lessons_sub": 0, "night_hours": 0.0}
             by_name[name]["hours"]        += attendance.calculate_actual_hours(r)
+            by_name[name]["night_hours"]  += attendance.calculate_night_hours(r)
             by_name[name]["lessons_main"] += int(r.get("lessons_main") or 0)
             by_name[name]["lessons_sub"]  += int(r.get("lessons_sub")  or 0)
 
         lines = [
-            f"{n}: 勤務 {v['hours']:.2f}h / レッスン メイン{v['lessons_main']} サブ{v['lessons_sub']}"
+            f"{n}: 勤務 {v['hours']:.2f}h / 深夜 {v['night_hours']:.2f}h / レッスン メイン{v['lessons_main']} サブ{v['lessons_sub']}"
             for n, v in sorted(by_name.items())
         ]
         messagebox.showinfo("集計結果", "\n".join(lines) if lines else "記録がありません。")
@@ -1007,13 +1192,71 @@ class AttendanceGUI(tk.Tk):
             except Exception:
                 messagebox.showerror("入力エラー", "年月は YYYY-MM の形式で入力してください。", parent=dlg)
                 return
-            lm = labor.LaborAgreementManager(labor.AttendanceManager())
-            data = lm.compute_monthly_summary(y, m)
+            try:
+                lm = labor.LaborAgreementManager(labor.AttendanceManager())
+                data = lm.compute_monthly_summary(y, m)
+            except Exception as exc:
+                messagebox.showerror("エラー", str(exc), parent=dlg)
+                return
             for it in tree.get_children():
                 tree.delete(it)
+            if not data:
+                messagebox.showinfo("36協定管理", f"{v} の勤怠データがありません。", parent=dlg)
+                return
+
+            violations = []
+            warnings_list = []
+
             for i, r in enumerate(data):
-                tag = "even" if i % 2 == 0 else "odd"
-                tree.insert("", tk.END, tags=(tag,), values=(r["name"], r["total_hours"], r["overtime_hours"], r["judgement"], r["warning_level"]))
+                level = r["warning_level"]
+                if level in ("赤", "濃赤"):
+                    tag = "row_red"
+                elif level == "オレンジ":
+                    tag = "row_orange"
+                elif level == "黄色":
+                    tag = "row_yellow"
+                else:
+                    tag = "even" if i % 2 == 0 else "odd"
+                tree.insert(
+                    "", tk.END, tags=(tag,),
+                    values=(
+                        r["name"],
+                        r["total_hours"],
+                        r["overtime_hours"],
+                        r["night_hours"],
+                        r["break_violations"],
+                        r["judgement"],
+                        r["warning_level"],
+                    ),
+                )
+
+                name = r["name"]
+                ot = r["overtime_hours"]
+                category = self._get_staff_category(name)
+
+                if category in ("年少者", "妊産婦"):
+                    if r.get("night_hours", 0.0) > 0:
+                        violations.append(f"・{name}さん({category})：深夜労働が記録されています")
+                    if ot > 0:
+                        violations.append(f"・{name}さん({category})：時間外労働が記録されています")
+
+                if ot >= 100:
+                    violations.append(f"・{name}さん：時間外 {ot}h（月100時間超 ─ 絶対的上限超過）")
+                elif ot >= 80:
+                    warnings_list.append(f"・{name}さん：時間外 {ot}h（月80時間超 ─ 特別条項限度超過）")
+                elif ot >= 45:
+                    warnings_list.append(f"・{name}さん：時間外 {ot}h（月45時間超 ─ 原則上限超過）")
+
+                if r.get("break_violations", 0) > 0:
+                    violations.append(f"・{name}さん：{r['break_violations']}件の休憩時間違反があります")
+
+            if violations or warnings_list:
+                parts = []
+                if violations:
+                    parts.append("【法令違反・上限超過】\n" + "\n".join(violations))
+                if warnings_list:
+                    parts.append("【要注意・警告】\n" + "\n".join(warnings_list))
+                messagebox.showwarning("⚠ 36協定 違反・警告", "\n\n".join(parts), parent=dlg)
 
         ttk.Button(top, text="表示", command=do_refresh).pack(side=tk.LEFT)
         def export_csv():
@@ -1048,16 +1291,27 @@ class AttendanceGUI(tk.Tk):
             except Exception:
                 messagebox.showerror("入力エラー", "年月は YYYY-MM 形式で入力してください。", parent=dlg)
                 return
-            w = int(months_var.get() or 3)
+            try:
+                w = int(months_var.get() or 3)
+            except Exception:
+                messagebox.showerror("入力エラー", "月数は整数で入力してください。", parent=dlg)
+                return
             path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")], parent=dlg)
             if not path:
                 return
-            lm = labor.LaborAgreementManager(labor.AttendanceManager())
-            lm.export_multi_month_csv(path, y, m, window=w)
-            messagebox.showinfo("出力完了", f"CSVを保存しました。\n{path}", parent=dlg)
+            try:
+                lm = labor.LaborAgreementManager(labor.AttendanceManager())
+                data = lm.compute_multi_month_average(y, m, window=w)
+                if not data:
+                    messagebox.showinfo("複数月CSV出力", "対象期間にデータがありません。", parent=dlg)
+                    return
+                lm.export_multi_month_csv(path, y, m, window=w)
+                messagebox.showinfo("出力完了", f"CSVを保存しました。\n{path}", parent=dlg)
+            except Exception as exc:
+                messagebox.showerror("エラー", str(exc), parent=dlg)
         ttk.Button(top, text="複数月CSV出力", command=export_multi_csv).pack(side=tk.LEFT, padx=6)
         ttk.Button(top, text="年間720チェック", command=lambda: self._do_annual_check(dlg)).pack(side=tk.LEFT, padx=6)
-        ttk.Label(top, text=" / 複数月平均(末月 YYYY-MM):", bg=C_BG, font=FONT_MAIN).pack(side=tk.LEFT, padx=(12,4))
+        tk.Label(top, text=" / 複数月平均(末月 YYYY-MM):", bg=C_BG, font=FONT_MAIN).pack(side=tk.LEFT, padx=(12,4))
         avg_entry = ttk.Entry(top, width=8)
         avg_entry.pack(side=tk.LEFT)
         avg_entry.insert(0, datetime.date.today().strftime("%Y-%m"))
@@ -1065,20 +1319,25 @@ class AttendanceGUI(tk.Tk):
         ttk.Entry(top, textvariable=months_var, width=3).pack(side=tk.LEFT, padx=(6,0))
         ttk.Button(top, text="複数月平均チェック", command=lambda: self._do_multi_month_check(dlg, avg_entry.get(), int(months_var.get() or 3))).pack(side=tk.LEFT, padx=6)
 
-        cols = ("name", "total", "overtime", "judgement", "level")
+        cols = ("name", "total", "overtime", "night", "breaks", "judgement", "level")
         tree = ttk.Treeview(dlg, columns=cols, show="headings", height=16)
         headers = {
-            "name": ("スタッフ名", 220),
-            "total": ("月間勤務時間", 120),
-            "overtime": ("時間外労働時間", 120),
+            "name": ("スタッフ名", 180),
+            "total": ("月間勤務時間", 110),
+            "overtime": ("時間外労働時間", 110),
+            "night": ("深夜時間", 100),
+            "breaks": ("休憩違反件数", 100),
             "judgement": ("36協定判定", 120),
-            "level": ("警告レベル", 120),
+            "level": ("警告レベル", 110),
         }
         for cid, (htext, w) in headers.items():
             tree.heading(cid, text=htext)
             tree.column(cid, width=w)
-        tree.tag_configure("odd",  background=C_ROW_ODD)
-        tree.tag_configure("even", background=C_ROW_EVEN)
+        tree.tag_configure("odd",        background=C_ROW_ODD)
+        tree.tag_configure("even",       background=C_ROW_EVEN)
+        tree.tag_configure("row_yellow", background="#FFFACD")
+        tree.tag_configure("row_orange", background="#FFE0B3")
+        tree.tag_configure("row_red",    background="#FFB3B3")
 
         sb = ttk.Scrollbar(dlg, orient=tk.VERTICAL, command=tree.yview)
         tree.configure(yscroll=sb.set)
@@ -1094,9 +1353,15 @@ class AttendanceGUI(tk.Tk):
         y = datetime.date.today().year
         lm = labor.LaborAgreementManager(labor.AttendanceManager())
         data = lm.compute_annual_summary(y)
-        offenders = [f"{r['name']}: {r['total_hours']}h" for r in data if r['over_720']]
-        if offenders:
-            messagebox.showwarning("年間720時間超過", "\n".join(offenders), parent=parent)
+        over_720 = [f"{r['name']}: {r['total_hours']}h" for r in data if r['over_720']]
+        over_360 = [f"{r['name']}: {r['annual_overtime_hours']}h" for r in data if r['over_360_overtime']]
+        messages = []
+        if over_720:
+            messages.append("[年間720時間超過]\n" + "\n".join(over_720))
+        if over_360:
+            messages.append("[年間時間外360時間超過]\n" + "\n".join(over_360))
+        if messages:
+            messagebox.showwarning("年間集計警告", "\n\n".join(messages), parent=parent)
         else:
             messagebox.showinfo("年間720時間チェック", "超過者はいません。", parent=parent)
 
@@ -1125,21 +1390,143 @@ class AttendanceGUI(tk.Tk):
         tree.column("window", width=100)
         tree.heading("flag", text="超過フラグ")
         tree.column("flag", width=120)
+        over_list = []
         for i, r in enumerate(data):
-            tag = "even" if i % 2 == 0 else "odd"
-            flag = "超過" if r.get("over_80_avg") else "正常"
+            is_over = r.get("over_80_avg", False)
+            tag = "row_red" if is_over else ("even" if i % 2 == 0 else "odd")
+            flag = "超過" if is_over else "正常"
             tree.insert("", tk.END, tags=(tag,), values=(r["name"], r["average_overtime"], r.get("window", window), flag))
+            if is_over:
+                over_list.append(f"・{r['name']}さん：平均時間外 {r['average_overtime']}h（80時間超）")
+
+        if over_list:
+            messagebox.showwarning(
+                "⚠ 複数月平均 時間外警告",
+                "【月平均80時間超過 ─ 特別条項の限度超過】\n\n" + "\n".join(over_list),
+                parent=parent,
+            )
+        else:
+            messagebox.showinfo("複数月平均チェック", "超過者はいません。", parent=parent)
 
     def check_overtime_alerts(self):
         today = datetime.date.today()
         lm = labor.LaborAgreementManager(labor.AttendanceManager())
-        data = lm.compute_monthly_summary(today.year, today.month)
-        alerts = []
-        for r in data:
-            if r["overtime_hours"] >= 45:
-                alerts.append(f"{r['name']}さんの今月の時間外労働は{r['overtime_hours']}時間です。")
-        if alerts:
-            messagebox.showwarning("36協定警告", "\n".join(alerts))
+        monthly = lm.compute_monthly_summary(today.year, today.month)
+        annual = lm.compute_annual_summary(today.year)
+
+        violations = []  # 法令違反・絶対的上限超過
+        warnings = []    # 要注意・危険域
+
+        for r in monthly:
+            name = r["name"]
+            ot = r["overtime_hours"]
+            category = self._get_staff_category(name)
+
+            # 年少者・妊産婦の法令違反チェック
+            if category in ("年少者", "妊産婦"):
+                if r.get("night_hours", 0.0) > 0:
+                    violations.append(f"・{name}さん({category})：深夜労働が記録されています")
+                if ot > 0:
+                    violations.append(f"・{name}さん({category})：時間外労働が記録されています")
+
+            # 月間時間外労働の段階別チェック
+            if ot >= 100:
+                violations.append(f"・{name}さん：今月の時間外労働 {ot}h（月100時間超 ─ 絶対的上限超過）")
+            elif ot >= 80:
+                warnings.append(f"・{name}さん：今月の時間外労働 {ot}h（月80時間超 ─ 特別条項限度超過）")
+            elif ot >= 45:
+                warnings.append(f"・{name}さん：今月の時間外労働 {ot}h（月45時間超 ─ 原則上限超過）")
+
+            # 休憩時間違反チェック
+            bv = r.get("break_violations", 0)
+            if bv > 0:
+                violations.append(f"・{name}さん：今月 {bv}件の休憩時間違反があります（労基法34条）")
+
+        # 年間チェック
+        for r in annual:
+            name = r["name"]
+            if r.get("over_360_overtime"):
+                violations.append(
+                    f"・{name}さん：年間時間外労働 {r['annual_overtime_hours']}h（360時間超 ─ 年間上限超過）"
+                )
+            if r.get("over_720"):
+                warnings.append(
+                    f"・{name}さん：年間総労働時間 {r['total_hours']}h（720時間超過）"
+                )
+
+        if (violations or warnings) and not self._overtime_alert_shown:
+            self._overtime_alert_shown = True
+            parts = []
+            if violations:
+                parts.append("【法令違反・上限超過】\n" + "\n".join(violations))
+            if warnings:
+                parts.append("【要注意・警告】\n" + "\n".join(warnings))
+            messagebox.showwarning("⚠ 36協定 違反・警告", "\n\n".join(parts))
+
+    # ── 労働基準法チェック（1日8h・週40h・休憩） ──────
+    def _check_entry_labor_law(self, name, date_str):
+        """登録・保存した1件について労働基準法の法定労働時間・休憩を確認する。"""
+        am_obj = labor.AttendanceManager()
+        rows = am_obj.read_rows()
+        row = labor.find_row(rows, name, date_str)
+        if not row:
+            return
+
+        violations = []
+
+        # 1日の法定労働時間チェック（実労働時間 > 8h）
+        actual_h = round(labor.calculate_actual_hours(row), 2)
+        if actual_h > 8.0:
+            over = round(actual_h - 8.0, 2)
+            violations.append(
+                f"・{name}さん（{date_str}）：実労働時間 {actual_h}h"
+                f"（法定上限1日8時間超 ／ {over}h超過）"
+            )
+
+        # 休憩時間チェック（労基法34条）
+        # 判定は総勤務時間（出退勤の差）で行う
+        total_h = am_obj.calculate_total_hours(row)
+        break_min = int(row.get("break_minutes") or 0)
+        if total_h > 8.0 and break_min < 60:
+            violations.append(
+                f"・{name}さん（{date_str}）：8時間超勤務の休憩 {break_min}分"
+                f"（60分以上必要 ／ {60 - break_min}分不足）"
+            )
+        elif total_h > 6.0 and break_min < 45:
+            violations.append(
+                f"・{name}さん（{date_str}）：6時間超勤務の休憩 {break_min}分"
+                f"（45分以上必要 ／ {45 - break_min}分不足）"
+            )
+
+        # 週40時間チェック
+        try:
+            date_obj = datetime.date.fromisoformat(date_str)
+            cal = date_obj.isocalendar()
+            week_key = (cal[0], cal[1])
+            week_total = 0.0
+            for r in rows:
+                try:
+                    d = datetime.date.fromisoformat(r.get("date", ""))
+                    dc = d.isocalendar()
+                    if r.get("name") == name and (dc[0], dc[1]) == week_key:
+                        week_total += labor.calculate_actual_hours(r)
+                except Exception:
+                    continue
+            week_total = round(week_total, 2)
+            if week_total > 40.0:
+                over_w = round(week_total - 40.0, 2)
+                violations.append(
+                    f"・{name}さん（{date_str}の週）：週の実労働時間 {week_total}h"
+                    f"（法定上限週40時間超 ／ {over_w}h超過）"
+                )
+        except Exception:
+            pass
+
+        if violations:
+            messagebox.showwarning(
+                "⚠ 労働基準法 違反・警告",
+                "以下の法定労働時間・休憩規定違反が検出されました。\n\n" + "\n".join(violations),
+            )
 
     # ── Excel 出力 ────────────────────────────────
     def _ask_export_month(self, all_rows):
@@ -1361,6 +1748,115 @@ class AttendanceGUI(tk.Tk):
             c.font = total_font; c.fill = total_fill; c.border = border
             c.alignment = left if ci == 1 else center
 
+        # ── シート3: 労働基準法違反レポート ─────────────────
+        ws3 = wb.create_sheet("労基法違反レポート")
+
+        hdr3_fill       = PatternFill("solid", fgColor="D35400")
+        hour_viol_fill  = PatternFill("solid", fgColor="FFCCCC")
+        break_viol_fill = PatternFill("solid", fgColor="FFF2CC")
+        ok_fill         = PatternFill("solid", fgColor="D5F5E3")
+
+        headers3    = ["スタッフ名", "日付 / 対象週", "違反種別", "実績値", "法定基準", "超過 / 不足"]
+        col_widths3 = [16, 18, 30, 14, 14, 14]
+        for ci, (h, w) in enumerate(zip(headers3, col_widths3), 1):
+            c = ws3.cell(row=1, column=ci, value=h)
+            c.fill = hdr3_fill; c.font = hdr_font; c.alignment = center; c.border = border
+            ws3.column_dimensions[openpyxl.utils.get_column_letter(ci)].width = w
+
+        am3 = labor.AttendanceManager()
+        violation_entries = []
+
+        # ─ 1日ごとのチェック（1日8h超・休憩不足）
+        for r in sorted_rows:
+            r_name   = r.get("name", "")
+            r_date   = r.get("date", "")
+            actual_h = round(labor.calculate_actual_hours(r), 2)
+            total_h  = am3.calculate_total_hours(r)
+            bk_min   = int(r.get("break_minutes") or 0)
+
+            if actual_h > 8.0:
+                over = round(actual_h - 8.0, 2)
+                violation_entries.append((
+                    r_name, r_date,
+                    "1日8時間超（法定労働時間）",
+                    f"{actual_h}h", "8.0h以内", f"+{over}h超過", "hour",
+                ))
+
+            if total_h > 8.0 and bk_min < 60:
+                violation_entries.append((
+                    r_name, r_date,
+                    "休憩不足（8時間超 → 60分必要）",
+                    f"{bk_min}分", "60分以上", f"{60 - bk_min}分不足", "break",
+                ))
+            elif total_h > 6.0 and bk_min < 45:
+                violation_entries.append((
+                    r_name, r_date,
+                    "休憩不足（6時間超 → 45分必要）",
+                    f"{bk_min}分", "45分以上", f"{45 - bk_min}分不足", "break",
+                ))
+
+        # ─ 週ごとのチェック（週40時間超）
+        checked_weeks = set()
+        for r in sorted_rows:
+            r_name = r.get("name", "")
+            try:
+                d = datetime.date.fromisoformat(r.get("date", ""))
+                cal = d.isocalendar()
+                wk_key = (r_name, cal[0], cal[1])
+                if wk_key in checked_weeks:
+                    continue
+                checked_weeks.add(wk_key)
+                week_key = (cal[0], cal[1])
+                wk_total = 0.0
+                for rw in all_rows:
+                    if rw.get("name") != r_name:
+                        continue
+                    try:
+                        d2 = datetime.date.fromisoformat(rw.get("date", ""))
+                        c2 = d2.isocalendar()
+                        if (c2[0], c2[1]) == week_key:
+                            wk_total += labor.calculate_actual_hours(rw)
+                    except Exception:
+                        continue
+                wk_total = round(wk_total, 2)
+                if wk_total > 40.0:
+                    over = round(wk_total - 40.0, 2)
+                    violation_entries.append((
+                        r_name, f"{r.get('date', '')}の週",
+                        "週40時間超（法定労働時間）",
+                        f"{wk_total}h", "40.0h以内", f"+{over}h超過", "hour",
+                    ))
+            except Exception:
+                continue
+
+        # ─ 違反データを書き込む
+        if violation_entries:
+            for ri, (vname, vdate, vtype, vactual, vstd, vdiff, vlevel) in enumerate(violation_entries, 2):
+                row_fill = hour_viol_fill if vlevel == "hour" else break_viol_fill
+                for ci, val in enumerate([vname, vdate, vtype, vactual, vstd, vdiff], 1):
+                    c = ws3.cell(row=ri, column=ci, value=val)
+                    c.font = body_font; c.fill = row_fill; c.border = border
+                    c.alignment = left if ci <= 2 else center
+        else:
+            c = ws3.cell(row=2, column=1, value="違反・警告事項はありません")
+            c.font = Font(bold=True, name="Meiryo UI", size=10, color="1A7A3C")
+            c.fill = ok_fill
+            c.alignment = left
+
+        # ─ 凡例
+        legend_row = len(violation_entries) + 4 if violation_entries else 4
+        ws3.cell(row=legend_row, column=1, value="【凡例】").font = Font(
+            bold=True, name="Meiryo UI", size=9
+        )
+        leg1 = ws3.cell(row=legend_row + 1, column=1, value="赤背景：1日・週の実労働時間が法定上限超過")
+        leg1.fill = hour_viol_fill
+        leg1.font = Font(name="Meiryo UI", size=9)
+        leg2 = ws3.cell(row=legend_row + 2, column=1, value="黄背景：休憩時間不足（労基法34条）")
+        leg2.fill = break_viol_fill
+        leg2.font = Font(name="Meiryo UI", size=9)
+
+        ws3.freeze_panes = "A2"
+
         try:
             wb.save(path)
             self.set_status(f"Excel出力完了: {os.path.basename(path)}")
@@ -1426,7 +1922,8 @@ class AttendanceGUI(tk.Tk):
             data  = _load_paid_leave()
             for it in bal_tree.get_children():
                 bal_tree.delete(it)
-            for i, name in enumerate(sorted(self.staff_list)):
+            staff_names = sorted([s.get("name", "") for s in self.staff_list if isinstance(s, dict)])
+            for i, name in enumerate(staff_names):
                 remaining, granted, used = _calc_paid_leave_balance(name, data, as_of)
                 used_yr = sum(
                     float(u.get("days", 0)) for u in data["usages"]
@@ -1450,7 +1947,8 @@ class AttendanceGUI(tk.Tk):
 
         glbl("スタッフ名:", 0, 0)
         g_name_var = tk.StringVar()
-        ttk.Combobox(gf, textvariable=g_name_var, values=self.staff_list,
+        ttk.Combobox(gf, textvariable=g_name_var,
+                     values=[s.get("name") for s in self.staff_list if isinstance(s, dict)],
                      width=16, state="readonly").grid(row=0, column=1, sticky=tk.W)
         glbl("付与日:", 0, 2)
         g_date_var = tk.StringVar(value=datetime.date.today().isoformat())
@@ -1562,7 +2060,8 @@ class AttendanceGUI(tk.Tk):
 
         ulbl("スタッフ名:", 0, 0)
         u_name_var = tk.StringVar()
-        ttk.Combobox(uf, textvariable=u_name_var, values=self.staff_list,
+        ttk.Combobox(uf, textvariable=u_name_var,
+                     values=[s.get("name") for s in self.staff_list if isinstance(s, dict)],
                      width=16, state="readonly").grid(row=0, column=1, sticky=tk.W)
         ulbl("取得日:", 0, 2)
         u_date_var = tk.StringVar(value=datetime.date.today().isoformat())
@@ -1678,7 +2177,7 @@ class AttendanceGUI(tk.Tk):
         tk.Label(hist_ctrl, text="スタッフ:", bg=C_BG, font=FONT_MAIN).pack(side=tk.LEFT)
         hist_name_var = tk.StringVar(value="(全員)")
         ttk.Combobox(hist_ctrl, textvariable=hist_name_var,
-                     values=["(全員)"] + self.staff_list,
+                     values=["(全員)"] + [s.get("name") for s in self.staff_list if isinstance(s, dict)],
                      width=14, state="readonly").pack(side=tk.LEFT, padx=(4, 10))
         tk.Label(hist_ctrl, text="年:", bg=C_BG, font=FONT_MAIN).pack(side=tk.LEFT)
         hist_year_var = tk.StringVar(value=str(datetime.date.today().year))
