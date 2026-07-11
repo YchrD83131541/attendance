@@ -47,3 +47,4 @@ GUIでは次の操作ができます。
 "# attendance" 
 "# attendance" 
 "# chatbot" 
+"# chatbot" 
