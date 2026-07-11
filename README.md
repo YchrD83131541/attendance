@@ -46,3 +46,4 @@ GUIでは次の操作ができます。
 必要に応じて日付指定やUIの追加、データベース保存へ拡張できます。
 "# attendance" 
 "# attendance" 
+"# chatbot" 
